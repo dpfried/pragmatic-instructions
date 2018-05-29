@@ -1,0 +1,8 @@
+credentials.py
+*.pyc
+__pycache__/
+.idea/
+.ipynb_checkpoints
+*.iml
+data/
+expts/
