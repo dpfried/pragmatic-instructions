@@ -2,15 +2,20 @@ from collections import namedtuple
 from os.path import join
 from os.path import expanduser
 
+from argparse import ArgumentParser
+
 Instance = namedtuple("Instance", "id, states, actions, utterances")
 
 NUM_TRANSITIONS = 5
 
-def add_corpus_args(parser):
-    parser.add_argument("--corpus", choices=['alchemy', 'scene', 'tangrams'])
-    parser.add_argument("--corpora_dir", default='data/scone/rlong')
-    parser.add_argument("--train_original", action='store_true')
-    parser.add_argument("--train_original_no_add_actions", action='store_true')
+def add_corpus_args(parser: ArgumentParser):
+    group = parser.add_argument_group('data')
+    group.add_argument("--corpus", choices=['alchemy', 'scene', 'tangrams'])
+    group.add_argument("--corpora_dir", default='data/scone/rlong')
+    group.add_argument("--train_original", action='store_true')
+    group.add_argument("--train_original_no_add_actions", action='store_true')
+    group.add_argument("--train_original_length_1", action='store_true')
+    group.add_argument("--max_transitions_per_train_instance", type=int, default=NUM_TRANSITIONS)
 
 def load_corpus_and_data(args, remove_unobserved_action_instances=True):
     if args.corpus == 'alchemy':
@@ -27,7 +32,8 @@ def load_corpus_and_data(args, remove_unobserved_action_instances=True):
 
     train_instances, dev_instances, test_instances = corpus.load_train_dev_test(
         args.corpora_dir, train_original=args.train_original, train_original_no_add_actions=args.train_original_no_add_actions,
-        remove_unobserved_action_instances=remove_unobserved_action_instances
+        remove_unobserved_action_instances=remove_unobserved_action_instances,
+        max_transitions_per_train_instance=args.max_transitions_per_train_instance,
     )
 
     return corpus, train_instances, dev_instances, test_instances
@@ -119,7 +125,7 @@ class Corpus(object):
         raise NotImplementedError()
 
 
-    def parse_instance_line(self, line):
+    def parse_instance_line(self, line, max_transitions):
         sections = line.split('\t')
         num_sections = len(sections)
         assert num_sections % 2 == 0
@@ -157,30 +163,35 @@ class Corpus(object):
         else:
             actions = None
 
+        states = states[:max_transitions+1]
+        actions = actions[:max_transitions]
+        utterances = utterances[:max_transitions]
+
         return Instance(id=id_, states=states, actions=actions, utterances=utterances)
 
 
-    def load_data(self, filename):
+    def load_data(self, filename, max_transitions):
         with open(filename) as f:
             instances = [
-                self.parse_instance_line(line) for line in f
+                self.parse_instance_line(line, max_transitions) for line in f
             ]
         return instances
 
 
-    def load_fold(self, root_dir, fold):
+    def load_fold(self, root_dir, fold, max_transitions):
         fname = join(root_dir, "%s-%s.tsv" % (self.dataset_name(), fold))
-        return self.load_data(fname)
+        return self.load_data(fname, max_transitions)
 
 
-    def load_train_dev_test(self, root_dir, train_original=False, train_original_no_add_actions=False, remove_unobserved_action_instances=True):
+    def load_train_dev_test(self, root_dir, train_original=False, train_original_no_add_actions=False,
+                            remove_unobserved_action_instances=True, max_transitions_per_train_instance=NUM_TRANSITIONS):
         train_name = "train-orig" if train_original else "train"
-        train_data = self.load_fold(root_dir, train_name)
-        dev_data = self.load_fold(root_dir, "dev")
-        test_data = self.load_fold(root_dir, "test")
+        train_data = self.load_fold(root_dir, train_name, max_transitions_per_train_instance)
+        dev_data = self.load_fold(root_dir, "dev", NUM_TRANSITIONS)
+        test_data = self.load_fold(root_dir, "test", NUM_TRANSITIONS)
         if train_original and not train_original_no_add_actions:
             train_full_by_id = {
-                inst.id: inst for inst in self.load_fold(root_dir, "train")
+                inst.id: inst for inst in self.load_fold(root_dir, "train", max_transitions_per_train_instance)
             }
             def update(inst):
                 keys = ["train-" + pfx + inst.id for pfx in ["", "A", "B", "C", "D", "E"]]
@@ -197,9 +208,16 @@ class Corpus(object):
             train_data = [update(inst) for inst in train_data]
 
         if remove_unobserved_action_instances:
+            print("removing unobserved action instances")
+            print("train data before filtering: {}".format(len(train_data)))
             train_data = [inst for inst in train_data if inst.actions is not None]
-            dev_data = [inst for inst in dev_data if inst.actions is not None]
-            test_data = [inst for inst in test_data if inst.actions is not None]
+            print("train data after filtering: {}".format(len(train_data)))
+            dev_data_filtered = [inst for inst in dev_data if inst.actions is not None]
+            test_data_filtered = [inst for inst in test_data if inst.actions is not None]
+            assert len(dev_data) == len(dev_data_filtered)
+            assert len(test_data) == len(test_data_filtered)
+            dev_data = dev_data_filtered
+            test_data = test_data_filtered
 
         return train_data, dev_data, test_data
 

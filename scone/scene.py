@@ -207,7 +207,7 @@ class SceneCorpus(Corpus):
     ACTION_IN_STATE_CONTEXT_DIM = 4 * (2 * NUM_COLORS)
     def embed_action_in_state_context(self, action, state_before, state_after, past_states, past_actions):
         emb_state_before = self._embed_state_notflat(state_before)
-        emb_state_after = self._embed_state_notflat(state_before)
+        emb_state_after = self._embed_state_notflat(state_after)
         persons_affected = np.zeros((2, 2, NUM_COLORS))
         anchor_points = np.zeros((2, 2, NUM_COLORS))
         assert persons_affected.shape[1:] == emb_state_before.shape[1:]

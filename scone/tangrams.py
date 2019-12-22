@@ -36,7 +36,7 @@ class TangramsCorpus(Corpus):
         ] + [
             swap(first_ix, second_ix)
             for first_ix in range(MAX_POSITIONS)
-            for second_ix in range(MAX_POSITIONS)
+            for second_ix in range(first_ix+1, MAX_POSITIONS)
         ]
 
 
@@ -68,7 +68,7 @@ class TangramsCorpus(Corpus):
                     yield insert(shape, ix)
             for ix in range(num_shapes_present):
                 yield remove(ix)
-                for other_ix in range(num_shapes_present):
+                for other_ix in range(ix+1, num_shapes_present):
                     if other_ix == ix:
                         continue
                     yield swap(ix, other_ix)

@@ -2,6 +2,7 @@
 corpus=$1
 seed=$2
 action_layer=$3
+latent_beam_size=$4
 
 if [[ -z $action_layer ]]; then
   action_layer="factored_multihead_contextual"
@@ -24,8 +25,12 @@ else
         exit 1
 fi
 
-out_suffix="${action_layer}_feed-actions_d=${f_dropout}_dim=${f_dim}_att-dim=${f_att}"
-out_dir="expts/follower/${corpus}/${out_suffix}"
+if [[ -z $latent_beam_size ]]; then
+  latent_beam_size=10
+fi
+
+out_suffix="${action_layer}_feed-actions_d=${f_dropout}_dim=${f_dim}_att-dim=${f_att}_bs=${latent_beam_size}"
+out_dir="expts/latent_follower/${corpus}/${out_suffix}"
 
 log_file="${out_dir}/${seed}.out"
 model_dir="${out_dir}/${seed}/"
@@ -50,4 +55,8 @@ python -u -m scone.follower \
         --feed_actions_to_decoder \
         --train_epochs 25 \
         --save_dir $model_dir \
+        --latent_actions \
+        --latent_beam_size $latent_beam_size \
+        --train_original \
+        --train_original_no_add_actions \
         | tee $log_file

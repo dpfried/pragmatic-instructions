@@ -21,6 +21,13 @@ InferenceState = namedtuple('InferenceState', 'prev_inference_state, lstm_state,
 
 EPS = 1e-8
 
+RANDOMIZED_BEAM_EPSILON = 0.15
+
+BEAM_EXPLORATION_METHODS = ['beam', 'randomized_beam_code', 'randomized_beam_paper']
+
+EXPLORATION_METHODS = BEAM_EXPLORATION_METHODS
+
+
 def blank_inference_state(current_world_state=None):
     return InferenceState(prev_inference_state=None,
                           lstm_state=None,
@@ -138,8 +145,46 @@ def ensemble_follow(models, ensemble_average_probs, initial_state, utterances, n
     # return _unpack_beam_item((score_v, inference_states))
     return _unpack_beam_item((score, inference_states))
 
+def eps_greedy_sample_code(scores, num_to_sample, epsilon, possible_action_indices):
+    # https://github.com/kelvinguu/lang2program/blob/dd4eb8439d29f0f72dd057946287551ed0f046a3/strongsup/utils.py#L13
+    indices_descending = list(sorted(range(len(scores)), key=lambda ix: scores[ix], reverse=True))
+    indices_descending = [ix for ix in indices_descending if ix in possible_action_indices]
+    if len(indices_descending) <= num_to_sample:
+        return indices_descending
+    if epsilon == 0:
+        return indices_descending[:num_to_sample]
+    sample = []
+    index_choices = list(range(len(indices_descending)))
+    for i in range(num_to_sample):
+        if random.random() <= epsilon or not i in index_choices:
+            choice_index = random.choice(index_choices)
+        else:
+            choice_index = i
+        sample.append(indices_descending[choice_index])
+        index_choices.remove(choice_index)
+    return sample
 
-def beam_ensemble_follow(beam_size, models, ensemble_average_probs, initial_state, utterances, num_actions_to_take=None, return_beam=False, predict_invalid=False, testing=True):
+def eps_greedy_sample_paper(scores, num_to_sample, epsilon, possible_action_indices):
+    indices_descending = list(sorted(range(len(scores)), key=lambda ix: scores[ix], reverse=True))
+    indices_descending = [ix for ix in indices_descending if ix in possible_action_indices]
+    if len(indices_descending) <= num_to_sample:
+        return indices_descending
+    if epsilon == 0:
+        return indices_descending[:num_to_sample]
+    sample = []
+    while len(sample) < num_to_sample:
+        assert indices_descending
+        if random.random() <= epsilon:
+            choice_index = random.choice(indices_descending)
+        else:
+            choice_index = indices_descending[0]
+        sample.append(choice_index)
+        indices_descending.remove(choice_index)
+    return sample
+
+def beam_ensemble_follow(beam_size, models, ensemble_average_probs, initial_state, utterances,
+                         num_actions_to_take=None, return_beam=False, predict_invalid=False, testing=True,
+                         exploration_method='beam', randomized_beam_epsilon=RANDOMIZED_BEAM_EPSILON):
     if num_actions_to_take is None:
         num_actions_to_take = len(utterances)
     assert num_actions_to_take <= len(utterances)
@@ -179,8 +224,17 @@ def beam_ensemble_follow(beam_size, models, ensemble_average_probs, initial_stat
             action_log_probs_v = action_log_probs.npvalue()
 
             #num_successors = min(beam_size, len(scored_actions[scored_actions > 0]))
-            num_successors = min(beam_size, len(inference_states[0].possible_actions))
-            successor_action_ixs = np.argpartition(action_log_probs_v, -num_successors)[-num_successors:]
+            possible_actions = inference_states[0].possible_actions
+            possible_action_indices = sorted([corpus.ACTIONS_TO_INDEX[ac] for ac in possible_actions])
+            num_successors = min(beam_size, len(possible_actions))
+            if exploration_method == 'randomized_beam_code':
+                successor_action_ixs = eps_greedy_sample_code(action_log_probs_v, num_successors, randomized_beam_epsilon, possible_action_indices)
+            elif exploration_method == 'randomized_beam_paper':
+                successor_action_ixs = eps_greedy_sample_paper(action_log_probs_v, num_successors, randomized_beam_epsilon, possible_action_indices)
+            elif exploration_method == 'beam':
+                successor_action_ixs = np.argpartition(action_log_probs_v, -num_successors)[-num_successors:]
+            else:
+                raise ValueError("invalid exploration_method {}".format(exploration_method))
 
             for successor_number, action_ix in enumerate(reversed(successor_action_ixs)):
                 if action_ix == corpus.INVALID_INDEX:
@@ -248,7 +302,11 @@ class ActionLayer(dy.Saveable):
 
     @property
     def num_attention_heads(self):
-        raise NotImplementedError()
+        return 1
+
+    @property
+    def attention_names(self):
+        return ["main"]
 
 
 class UnfactoredSoftmax(ActionLayer):
@@ -269,14 +327,6 @@ class UnfactoredSoftmax(ActionLayer):
         support = sorted([self.corpus.ACTIONS_TO_INDEX[ac] for ac in possible_actions])
         W = dy.parameter(self.p_W)
         return dy.log_softmax(W * input, support)
-
-    @property
-    def num_attention_heads(self):
-        return 1
-
-    @property
-    def attention_names(self):
-        return ["main"]
 
 
 class Follower(dy.Saveable):
@@ -682,7 +732,11 @@ def test_on_instances(agents, instances, beam_size=None, num_actions_to_take=sco
         if beam_size is None:
             pred_states, pred_actions, score, attention_dists = ensemble_follow(agents, False, instance.states[0], utterances, num_actions_to_take=min(num_actions_to_take, len(utterances)), predict_invalid=predict_invalid)
         else:
-            pred_states, pred_actions, score, attention_dists = beam_ensemble_follow(beam_size, agents, False, instance.states[0], utterances, num_actions_to_take=min(num_actions_to_take, len(utterances)), return_beam=False, predict_invalid=predict_invalid)
+            pred_states, pred_actions, score, attention_dists = beam_ensemble_follow(
+                beam_size, agents, False, instance.states[0], utterances,
+                num_actions_to_take=min(num_actions_to_take, len(utterances)),
+                return_beam=False, predict_invalid=predict_invalid
+            )
 
         # scores.append(score)
         scores.append(score.npvalue())
@@ -700,7 +754,7 @@ def test_on_instances(agents, instances, beam_size=None, num_actions_to_take=sco
         print("%s mean score: %0.4f" % (name, np.mean(scores)))
     return stats
 
-def max_margin_weighting(instance, pred_states, pred_scores_v):
+def max_margin_weighting(instance, pred_states, pred_scores_v, args):
     pred_scores_v = np.array(pred_scores_v)
     assert len(pred_states) == len(pred_scores_v)
     # assert len(instance.states) == len(pred_states[0])
@@ -713,7 +767,13 @@ def max_margin_weighting(instance, pred_states, pred_scores_v):
     if not correct_denotations:
         weights = np.zeros_like(pred_scores_v)
     else:
-        weights = dy.exp(dy.log_softmax(dy.inputVector(pred_scores_v), correct_denotations)).npvalue()
+        log_weights = dy.log_softmax(dy.inputVector(pred_scores_v), correct_denotations)
+        if args.latent_update_beta != 1.0:
+            log_weights *= args.latent_update_beta
+            weights = dy.exp(dy.log_softmax(log_weights, correct_denotations)).npvalue()
+        else:
+            weights = dy.exp(log_weights).npvalue()
+        # weights = dy.exp().npvalue()
 
     return weights, correct_denotations
 
@@ -739,6 +799,7 @@ def train(args):
         # actions that's ok
         args, remove_unobserved_action_instances=not args.latent_actions
     )
+    print("num actions: {}".format(len(corpus.ACTIONS)))
 
     if args.corpus == 'alchemy':
         from scone.alchemy_models import AlchemyFactored, AlchemyFactoredSplit, AlchemyFactoredMultihead, AlchemyFactoredMultiheadContextual
@@ -865,21 +926,30 @@ def train(args):
         losses = []
         if latent:
             num_correct_denotations = []
+            num_traces = []
         enum = enumerate(instances)
         if train and not args.hide_progress:
-            enum = tqdm.tqdm(enum, desc="instance", total=len(instances))
+            enum = tqdm.tqdm(enum, desc="instance", total=len(instances), ncols=80)
         for i, instance in enum:
             dy.renew_cg()
             if latent:
-                beam = beam_ensemble_follow(args.latent_beam_size, [follower], False, instance.states[0],
-                                            instance.utterances, num_actions_to_take=None, return_beam=True,
-                                            predict_invalid=False,
-                                            # todo: try varying the dropout mask?
-                                            testing=not train)
+                if args.exploration_method in BEAM_EXPLORATION_METHODS:
+                    beam = beam_ensemble_follow(
+                        args.latent_beam_size, [follower], False, instance.states[0],
+                        instance.utterances, num_actions_to_take=None, return_beam=True,
+                        predict_invalid=False,
+                        # todo: try varying the dropout mask?
+                        testing=not train,
+                        exploration_method=args.exploration_method,
+                    )
+                else:
+                    raise NotImplementedError('exploration_method {}'.format(args.exploration_method))
                 pred_states, pred_actions, pred_scores, _ = zip(*beam)
                 pred_scores_v = np.array([score.value() for score in pred_scores])
-                weights, correct_denotations = trace_weighting_function(instance, pred_states, pred_scores_v)
+                weights, correct_denotations = trace_weighting_function(instance, pred_states, pred_scores_v,
+                                                                        args=args)
                 num_correct_denotations.append(len(correct_denotations))
+                num_traces.append(len(beam))
                 assert len(weights) == len(pred_scores_v)
                 # print(pred_scores)
                 # print(weights)
@@ -894,13 +964,19 @@ def train(args):
             if train:
                 loss.backward()
                 optimizer.update()
+            if latent and args.verbose and i % 1000 == 0:
+                mean_correct = np.mean(num_correct_denotations[-1000:])
+                mean_traces = np.mean(num_traces[-1000:])
+                print_fn = print if args.hide_progress else tqdm.tqdm.write
+                print_fn("%s mean correct denotations:\t%0.2f / %d\t(%0.2f)" % (name, mean_correct, mean_traces, mean_correct / mean_traces))
         if train:
             optimizer.status()
         mean_loss = np.mean(losses)
         print("%s loss: %s" % (name, mean_loss))
         if latent:
             mean_correct = np.mean(num_correct_denotations)
-            print("%s mean correct denotations:\t%0.2f / %d\t(%0.2f)" % (name, mean_correct, args.latent_beam_size, mean_correct / args.latent_beam_size))
+            mean_traces = np.mean(num_traces)
+            print("%s mean correct denotations:\t%0.2f / %d\t(%0.2f)" % (name, mean_correct, mean_traces, mean_correct / mean_traces))
         print()
         return {'loss': mean_loss}
 
@@ -970,6 +1046,7 @@ def train(args):
     for epoch in range(args.train_epochs):
         print("epoch %d" % epoch)
         random.shuffle(train_instances)
+        epoch_start = time.time()
         if args.latent_actions:
             loss_fn(train_instances, "train_latent", train=True, latent=True,
                     trace_weighting_function=max_margin_weighting)
@@ -985,6 +1062,7 @@ def train(args):
 
         # decrease learning rate for sgd
         optimizer.update_epoch()
+        print("epoch time: {:.2f} sec".format(time.time() - epoch_start))
 
     #if (args.train_epochs - 1) % args.decode_interval != 0:
         # log_train_decode(args.train_epochs)
@@ -1022,7 +1100,13 @@ def make_parser():
 
     parser.add_argument("--test_decode", action='store_true')
 
-    parser.add_argument("--action_layer", choices=["unfactored", "factored", "factored_split", "factored_multihead", "factored_multihead_contextual"], default="factored_multihead")
+    parser.add_argument("--action_layer", choices=[
+        "unfactored",
+        "factored",
+        "factored_split",
+        "factored_multihead",
+        "factored_multihead_contextual"
+    ], default="factored_multihead")
 
     parser.add_argument("--feed_actions_to_decoder", action='store_true')
 
@@ -1037,6 +1121,10 @@ def make_parser():
     # latent training
     parser.add_argument("--latent_actions", action='store_true')
     parser.add_argument("--latent_beam_size", type=int)
+    parser.add_argument("--exploration_method", default='beam',
+                        choices=EXPLORATION_METHODS)
+    parser.add_argument("--randomized_beam_epsilon", type=float, default=RANDOMIZED_BEAM_EPSILON)
+    parser.add_argument("--latent_update_beta", type=float, default=1.0)
 
     scone.corpus.add_corpus_args(parser)
 

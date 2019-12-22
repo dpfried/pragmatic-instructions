@@ -107,7 +107,7 @@ def run(arg_parser, entry_function):
         out_file.write('\n\n')
         out_file.write(' '.join(sys.argv))
         out_file.write('\n\n')
-        json.dump(vars(args), out_file)
+        json.dump(vars(args), out_file, sort_keys=True, indent=2)
         out_file.write('\n\n')
 
     log(sys.stdout)
