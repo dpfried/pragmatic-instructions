@@ -15,6 +15,8 @@ import util
 from models import GlobalAttention, run_lstm, OneHotVocabEmbeddings
 from util import GlorotInitializer, softmax
 
+from scone.follower_utils import random_gumbel
+
 import sys
 
 InferenceState = namedtuple('InferenceState', 'prev_inference_state, lstm_state, lstm_h, current_world_state, last_action, action_count, log_probs, possible_actions, attention_dist')
@@ -23,10 +25,9 @@ EPS = 1e-8
 
 RANDOMIZED_BEAM_EPSILON = 0.15
 
-BEAM_EXPLORATION_METHODS = ['beam', 'randomized_beam_code', 'randomized_beam_paper']
+BEAM_EXPLORATION_METHODS = ['beam', 'randomized_beam_code', 'randomized_beam_paper', 'gumbel_noised_beam']
 
-EXPLORATION_METHODS = BEAM_EXPLORATION_METHODS
-
+EXPLORATION_METHODS = BEAM_EXPLORATION_METHODS + ['sample']
 
 def blank_inference_state(current_world_state=None):
     return InferenceState(prev_inference_state=None,
@@ -233,6 +234,14 @@ def beam_ensemble_follow(beam_size, models, ensemble_average_probs, initial_stat
                 successor_action_ixs = eps_greedy_sample_paper(action_log_probs_v, num_successors, randomized_beam_epsilon, possible_action_indices)
             elif exploration_method == 'beam':
                 successor_action_ixs = np.argpartition(action_log_probs_v, -num_successors)[-num_successors:]
+            elif exploration_method == 'gumbel_noised_beam':
+                # Do simple Gumbel noising of the beam to sample without replacement from the token distribution. Note that this doesn't result in sampling-without-replacement of the entire sequence, for the reasons outlined in Kool et al. Stochastic Beams.
+                # TODO: consider implementing Stochastic Beams
+                noised_scores = action_log_probs + random_gumbel(len(action_log_probs_v))
+
+                # apply another log softmax with constraints because was getting issues where invalid actions were selected
+                noised_scores_v = dy.log_softmax(noised_scores, possible_action_indices).npvalue()
+                successor_action_ixs = np.argpartition(noised_scores_v, -num_successors)[-num_successors:]
             else:
                 raise ValueError("invalid exploration_method {}".format(exploration_method))
 
@@ -930,6 +939,8 @@ def train(args):
         enum = enumerate(instances)
         if train and not args.hide_progress:
             enum = tqdm.tqdm(enum, desc="instance", total=len(instances), ncols=80)
+        total_weights = 0.0
+        num_weights = 0
         for i, instance in enum:
             dy.renew_cg()
             if latent:
@@ -942,6 +953,13 @@ def train(args):
                         testing=not train,
                         exploration_method=args.exploration_method,
                     )
+                elif args.exploration_method == 'sample':
+                    beam = []
+                    for _ in range(args.latent_beam_size):
+                        beam.append(ensemble_follow(
+                            [follower], False, instance.states[0], instance.utterances, num_actions_to_take=None,
+                            sample=True, sample_alpha=1.0, random_state=None, testing=not train,
+                        ))
                 else:
                     raise NotImplementedError('exploration_method {}'.format(args.exploration_method))
                 pred_states, pred_actions, pred_scores, _ = zip(*beam)
@@ -955,7 +973,12 @@ def train(args):
                 # print(weights)
                 loss = dy.scalarInput(0.0)
                 for score, weight in zip(pred_scores, weights):
-                    loss += - score * dy.scalarInput(weight)
+                    total_weights += weight
+                    num_weights += 1
+                    if args.latent_weight_baseline:
+                        weight = weight - (total_weights / num_weights)
+                    if weight != 0.0:
+                        loss += - score * dy.scalarInput(weight)
                 # loss = sum([score * dy.scalarInput(weight) for score, weight in zip(pred_scores, weights)])
             else:
                 loss = follower.loss(instance.states, instance.actions, instance.utterances, testing=not train)
@@ -1125,6 +1148,8 @@ def make_parser():
                         choices=EXPLORATION_METHODS)
     parser.add_argument("--randomized_beam_epsilon", type=float, default=RANDOMIZED_BEAM_EPSILON)
     parser.add_argument("--latent_update_beta", type=float, default=1.0)
+
+    parser.add_argument("--latent_weight_baseline", action='store_true')
 
     scone.corpus.add_corpus_args(parser)
 

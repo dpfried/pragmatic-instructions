@@ -1,5 +1,8 @@
 import dynet as dy
 
+def random_gumbel(dim):
+    return -dy.log(-dy.log(dy.random_uniform((dim,), 0.0, 1.0)))
+
 def action_in_state_context_bonuses(corpus, state, inputs, W_context_action, W_action, predict_invalid, past_states, past_actions):
     all_inputs = dy.concatenate(inputs)
     bonuses = []
